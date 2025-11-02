@@ -1,0 +1,78 @@
+import 'dotenv/config';
+import express from 'express';
+import crypto from 'crypto';
+import bodyParser from 'body-parser';
+import { google } from 'googleapis';
+
+const app = express();
+
+// Verifica firma webhook Shopify
+function verifyHmac(req, res, buf) {
+  const hmac = req.get('X-Shopify-Hmac-Sha256');
+  if (!hmac) return;
+  const digest = crypto.createHmac('sha256', process.env.SHOPIFY_WEBHOOK_SECRET)
+    .update(buf).digest('base64');
+  if (digest !== hmac) throw new Error('HMAC non valido');
+}
+app.use(bodyParser.json({ verify: verifyHmac }));
+
+// Connessione Google Content API
+const auth = new google.auth.GoogleAuth({ scopes: ['https://www.googleapis.com/auth/content'] });
+const content = google.content({ version: 'v2.1', auth });
+
+// Variabili
+const M = process.env.MERCHANT_ID;
+const LANG = process.env.CONTENT_LANGUAGE || 'it';
+const CTRY = process.env.TARGET_COUNTRY || 'IT';
+const CH = process.env.CHANNEL || 'online';
+const CUR = process.env.CURRENCY || 'EUR';
+const SITE = process.env.SHOP_URL;
+const SHIP = process.env.SHIPPING_PRICE || '6.90';
+
+// Funzioni helper
+const strip = h => (h || '').replace(/<[^>]*>?/gm, '').slice(0, 5000);
+const opt = (p,v,names)=>[
+  {n:p.options?.[0],v:v.option1},{n:p.options?.[1],v:v.option2},{n:p.options?.[2],v:v.option3}
+].filter(Boolean).find(o=> (o.n||'').toLowerCase() && names.some(x=>o.n.toLowerCase().includes(x)))?.v;
+const gender = t => {
+  const s=(t||'').toLowerCase();
+  if (s.includes('donna')||s.includes('women')) return 'female';
+  if (s.includes('uomo')||s.includes('men')) return 'male';
+  return 'unisex';
+};
+
+function toItem(p, v){
+  return {
+    offerId: String(v.id),
+    title: p.title,
+    description: strip(p.body_html),
+    link: `${SITE}/products/${p.handle}?variant=${v.id}`,
+    imageLink: (p.images?.[0]?.src)||'',
+    additionalImageLinks: (p.images||[]).slice(1,10).map(i=>i.src),
+    contentLanguage: LANG, targetCountry: CTRY, channel: CH,
+    price: { value: String(v.price||p.variants?.[0]?.price||'0'), currency: CUR },
+    availability: (v.inventory_quantity>0 || v.inventory_policy==='continue') ? 'in stock' : 'out of stock',
+    brand: p.vendor || 'Myfitsport67',
+    gtin: (v.barcode && v.barcode.length>=8) ? v.barcode : undefined,
+    mpn: v.sku || undefined,
+    googleProductCategory: 'Apparel & Accessories',
+    itemGroupId: String(p.id),
+    size: opt(p,v,['taglia','size']),
+    color: opt(p,v,['colore','color']),
+    gender: gender(p.tags),
+    ageGroup: 'adult',
+    condition: 'new',
+    shipping: [{ country: CTRY, service: 'Standard', price: { value: String(SHIP), currency: CUR } }]
+  };
+}
+
+async function upsert(p){ for (const v of p.variants) await content.products.insert({ merchantId: M, requestBody: toItem(p,v) }); }
+async function del(p){ for (const v of p.variants) await content.products.delete({ merchantId: M, productId: `online:${LANG}:${CTRY}:${v.id}` }); }
+
+// Endpoints webhook
+app.post('/webhooks/products/create', async (req,res)=>{ try{ await upsert(req.body); res.send('OK'); }catch(e){ console.error(e); res.status(500).send('ERR'); }});
+app.post('/webhooks/products/update', async (req,res)=>{ try{ await upsert(req.body); res.send('OK'); }catch(e){ console.error(e); res.status(500).send('ERR'); }});
+app.post('/webhooks/products/delete', async (req,res)=>{ try{ await del(req.body); res.send('OK'); }catch(e){ console.error(e); res.status(500).send('ERR'); }});
+
+app.get('/health',(_,res)=>res.send('alive'));
+app.listen(process.env.PORT||8080, ()=>console.log('Server pronto'));
